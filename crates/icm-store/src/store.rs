@@ -300,6 +300,117 @@ impl SqliteStore {
         Ok(out)
     }
 
+    /// Read a raw string value from `icm_metadata` by key.
+    /// Returns `Ok(None)` when the key is absent.
+    pub fn get_metadata_str(&self, key: &str) -> IcmResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM icm_metadata WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    /// Upsert a raw string value into `icm_metadata`.
+    pub fn set_metadata_str(&self, key: &str, value: &str) -> IcmResult<()> {
+        self.conn
+            .execute(
+                "INSERT INTO icm_metadata (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// List every **active** fact in the database across all entities.
+    /// Used by `icm export` to produce a full snapshot.
+    pub fn list_all_facts(&self) -> IcmResult<Vec<icm_core::Fact>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, entity, key, value, source, created_at, superseded_at
+                 FROM facts
+                 WHERE superseded_at IS NULL
+                 ORDER BY entity ASC, key ASC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt.query_map([], row_to_fact).map_err(db_err)?;
+        collect_rows(rows)
+    }
+
+    /// Create a consistent, point-in-time backup of the database using the
+    /// SQLite Online Backup API (`sqlite3_backup_init/step/finish`).
+    ///
+    /// Unlike `std::fs::copy`, this is safe while other processes are writing:
+    /// the backup API locks pages one at a time, retries any page touched by a
+    /// concurrent writer, and produces a fully checkpointed destination that
+    /// includes every committed WAL frame. No need to copy `-wal`/`-shm`
+    /// sidecars separately.
+    ///
+    /// The destination file is created (or overwritten) by the API itself.
+    /// Returns an error if the source cannot be opened for backup or the
+    /// destination cannot be written.
+    pub fn backup_to(&self, dst: &Path) -> IcmResult<()> {
+        // Ensure the destination directory exists (parallel to how with_dims
+        // creates the parent dir for the main DB).
+        if let Some(parent) = dst.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| IcmError::Database(format!("creating backup dir: {e}")))?;
+            }
+        }
+        // `Connection::backup` is gated behind the `backup` rusqlite feature.
+        // It calls sqlite3_backup_init/step/finish and handles the "source
+        // page was dirtied during backup" retry loop internally, so a
+        // concurrent writer does not corrupt the destination.
+        self.conn
+            .backup(rusqlite::DatabaseName::Main, dst, None)
+            .map_err(|e| IcmError::Database(format!("sqlite online backup failed: {e}")))?;
+
+        // POW-1: Restrict permissions on the backup file. A backup contains
+        // the full memory database (potentially including API keys, client
+        // data) and must not be world-readable. Mirrors the 0o600 mode used
+        // for credentials in cloud.rs. Non-fatal — warn rather than aborting
+        // a successful backup over a permission failure (e.g. FAT32 / NFS).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o600)) {
+                tracing::warn!(
+                    path = %dst.display(),
+                    "backup_to: could not restrict permissions to 0o600: {e}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Atomically claim the backup slot.
+    ///
+    /// Returns `true` if **this** process should perform the backup (i.e. no
+    /// other process has claimed the slot within the configured interval).
+    /// Modelled on `maybe_auto_decay` — a single SQL statement wins the race
+    /// so that in a thundering-herd scenario (many agents starting at once)
+    /// exactly one performs the backup and the rest skip it (KRIT-5).
+    pub fn claim_backup_slot(&self, interval_days: u32) -> IcmResult<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = self
+            .conn
+            .execute(
+                "INSERT INTO icm_metadata (key, value) VALUES ('last_backup_at', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = ?1
+                 WHERE value IS NULL
+                    OR julianday(?1) - julianday(value) >= ?2",
+                rusqlite::params![now, f64::from(interval_days)],
+            )
+            .map_err(db_err)?;
+        Ok(changed > 0)
+    }
+
     /// Rebuild the FTS5 shadow tables from their content tables and `REINDEX`
     /// every b-tree index (issue #313). This repairs the most common
     /// corruption class — damaged indexes / FTS shadow tables with intact
@@ -2038,10 +2149,14 @@ impl MemoryStore for SqliteStore {
     }
 
     fn list_all(&self) -> IcmResult<Vec<Memory>> {
+        // POW-3: Removed the previous LIMIT 10000 — `list_all` must return
+        // every row for `icm export` to produce a complete backup. A silent
+        // truncation at 10 000 records would cause unnoticed data loss during
+        // disaster recovery.
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT {SELECT_COLS} FROM memories ORDER BY weight DESC LIMIT 10000"
+                "SELECT {SELECT_COLS} FROM memories ORDER BY weight DESC"
             ))
             .map_err(db_err)?;
 
@@ -8755,5 +8870,92 @@ mod tests {
             .upsert_code_area("p", "g.rs", None, None, None)
             .unwrap();
         assert_eq!(store.code_area_count().unwrap(), 2);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // claim_backup_slot tests
+    // ──────────────────────────────────────────────────────────────
+
+    /// With no existing row in icm_metadata, the very first call must claim
+    /// the slot and return `true`.
+    #[test]
+    fn claim_backup_slot_first_call_wins() {
+        let store = test_store();
+        let claimed = store.claim_backup_slot(7).unwrap();
+        assert!(claimed, "first call should claim the backup slot");
+    }
+
+    /// A second call within the interval should see that the row was recently
+    /// written and return `false` (another process already owns this window).
+    #[test]
+    fn claim_backup_slot_second_call_within_interval_skips() {
+        let store = test_store();
+        // First call sets last_backup_at to now.
+        let first = store.claim_backup_slot(7).unwrap();
+        assert!(first, "first call must win");
+        // Second call with the same interval — elapsed days ≈ 0, threshold 7.
+        let second = store.claim_backup_slot(7).unwrap();
+        assert!(!second, "second call within interval should be skipped");
+    }
+
+    /// With interval_days = 0 the condition `elapsed >= 0` is always true, so
+    /// even a call immediately after a previous one should win again.
+    #[test]
+    fn claim_backup_slot_after_interval_wins_again() {
+        let store = test_store();
+        let first = store.claim_backup_slot(0).unwrap();
+        assert!(first, "first call must win");
+        // With interval_days = 0 any positive elapsed time satisfies >= 0,
+        // and julianday(now) - julianday(now) == 0, which still satisfies >= 0.
+        let second = store.claim_backup_slot(0).unwrap();
+        assert!(second, "with interval_days=0 every call should win");
+    }
+
+    /// Error-recovery path: after a failed backup the code resets
+    /// `last_backup_at` to the Unix epoch ("1970-01-01T00:00:00+00:00") so
+    /// the next startup will retry immediately. Verify that a subsequent call
+    /// returns `true` regardless of the configured interval.
+    #[test]
+    fn claim_backup_slot_epoch_reset_allows_immediate_retry() {
+        let store = test_store();
+        // Simulate the failure-reset: write the epoch timestamp directly.
+        store
+            .set_metadata_str("last_backup_at", "1970-01-01T00:00:00+00:00")
+            .unwrap();
+        // Any realistic interval — say 7 days. Elapsed since epoch is huge.
+        let claimed = store.claim_backup_slot(7).unwrap();
+        assert!(
+            claimed,
+            "epoch-reset should allow an immediate retry regardless of interval"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // list_all_facts tests
+    // ──────────────────────────────────────────────────────────────
+
+    /// When a second `set_fact` supersedes the first for the same (entity, key),
+    /// `list_all_facts` should return exactly one active fact — the latest one.
+    #[test]
+    fn list_all_facts_returns_only_active() {
+        let store = test_store();
+        // Insert first value.
+        store.set_fact("host:db", "ip", "10.0.0.1", "test").unwrap();
+        // Supersede it with a new value.
+        store.set_fact("host:db", "ip", "10.0.0.2", "test").unwrap();
+        let facts = store.list_all_facts().unwrap();
+        assert_eq!(
+            facts.len(),
+            1,
+            "list_all_facts must return exactly 1 active fact after supersession"
+        );
+        assert_eq!(
+            facts[0].value, "10.0.0.2",
+            "the active fact must be the latest value"
+        );
+        assert!(
+            facts[0].superseded_at.is_none(),
+            "the returned fact must have superseded_at = None (still active)"
+        );
     }
 }
