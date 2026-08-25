@@ -2267,8 +2267,7 @@ fn main() -> Result<()> {
                         emb_ref,
                         &cfg.memory,
                         extract_every,
-                        cfg.extraction.store_raw,
-                        &cfg.extraction.summarizer,
+                        &cfg.extraction,
                         &cfg.archive,
                     )
                 }
@@ -3430,8 +3429,7 @@ fn cmd_hook_post(
     embedder: Option<&dyn icm_core::Embedder>,
     memory_cfg: &crate::config::MemoryConfig,
     extract_every: usize,
-    store_raw: bool,
-    extraction_summarizer: &crate::config::SummarizerConfig,
+    extraction_cfg: &crate::config::ExtractionConfig,
     archive_cfg: &crate::config::ArchiveConfig,
 ) -> Result<()> {
     let Some(input) = read_stdin_utf8_lossy() else {
@@ -3486,6 +3484,13 @@ fn cmd_hook_post(
         }
     }
 
+    // `[extraction].enabled = false` (issue #424) stops here — archive
+    // and code-areas capture above are independent features and must
+    // keep running regardless of this flag.
+    if !extraction_cfg.enabled {
+        return Ok(());
+    }
+
     // Track tool calls in SQLite (atomic, persists across reboots)
     let count = store.increment_hook_counter().unwrap_or(1);
 
@@ -3516,7 +3521,7 @@ fn cmd_hook_post(
     // embedder. The worker (`icm extract-pending` / SessionEnd fork) will
     // dequeue and run the configured LLM CLI. ~50ms / fire vs ~3.7s
     // for the inline fastembed path below.
-    if extraction_summarizer.provider != "none" {
+    if extraction_cfg.summarizer.provider != "none" {
         // Cap to 8 KB to keep the queue reasonable. LLM extraction works
         // fine on the most recent slice; very long outputs are rare and
         // their tail is what matters most for auto-context anyway.
@@ -3525,7 +3530,7 @@ fn cmd_hook_post(
             Ok(_) => {
                 eprintln!(
                     "[icm] enqueued raw output for async LLM extraction (provider={})",
-                    extraction_summarizer.provider,
+                    extraction_cfg.summarizer.provider,
                 );
             }
             Err(e) => {
@@ -3547,7 +3552,7 @@ fn cmd_hook_post(
         store,
         capped_inline,
         &project,
-        store_raw,
+        extraction_cfg.store_raw,
         icm_core::Importance::Medium,
         embedder,
     ) {
