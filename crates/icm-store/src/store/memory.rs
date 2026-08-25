@@ -597,7 +597,9 @@ impl MemoryStore for SqliteStore {
         // disaster recovery.
         let mut stmt = self
             .conn
-            .prepare(&format!("SELECT {SELECT_COLS} FROM memories ORDER BY weight DESC"))
+            .prepare(&format!(
+                "SELECT {SELECT_COLS} FROM memories ORDER BY weight DESC"
+            ))
             .map_err(db_err)?;
 
         let rows = stmt.query_map([], row_to_memory).map_err(db_err)?;
