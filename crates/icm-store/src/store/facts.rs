@@ -28,6 +28,22 @@ fn row_to_fact(row: &rusqlite::Row<'_>) -> rusqlite::Result<Fact> {
 }
 
 impl SqliteStore {
+    /// List every **active** fact in the database across all entities.
+    /// Used by `icm export` to produce a full snapshot.
+    pub fn list_all_facts(&self) -> IcmResult<Vec<icm_core::Fact>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, entity, key, value, source, created_at, superseded_at
+                 FROM facts
+                 WHERE superseded_at IS NULL
+                 ORDER BY entity ASC, key ASC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt.query_map([], row_to_fact).map_err(db_err)?;
+        collect_rows(rows)
+    }
+
     fn set_fact_inner(
         &self,
         entity: &str,

@@ -8,6 +8,101 @@ use super::*;
 use rusqlite::OptionalExtension;
 
 impl SqliteStore {
+    /// Read a raw string value from `icm_metadata` by key.
+    /// Returns `Ok(None)` when the key is absent.
+    pub fn get_metadata_str(&self, key: &str) -> IcmResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM icm_metadata WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)
+    }
+
+    /// Upsert a raw string value into `icm_metadata`.
+    pub fn set_metadata_str(&self, key: &str, value: &str) -> IcmResult<()> {
+        self.conn
+            .execute(
+                "INSERT INTO icm_metadata (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Create a consistent, point-in-time backup of the database using the
+    /// SQLite Online Backup API (`sqlite3_backup_init/step/finish`).
+    ///
+    /// Unlike `std::fs::copy`, this is safe while other processes are writing:
+    /// the backup API locks pages one at a time, retries any page touched by a
+    /// concurrent writer, and produces a fully checkpointed destination that
+    /// includes every committed WAL frame. No need to copy `-wal`/`-shm`
+    /// sidecars separately.
+    ///
+    /// The destination file is created (or overwritten) by the API itself.
+    /// Returns an error if the source cannot be opened for backup or the
+    /// destination cannot be written.
+    pub fn backup_to(&self, dst: &Path) -> IcmResult<()> {
+        // Ensure the destination directory exists (parallel to how with_dims
+        // creates the parent dir for the main DB).
+        if let Some(parent) = dst.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| IcmError::Database(format!("creating backup dir: {e}")))?;
+            }
+        }
+        // `Connection::backup` is gated behind the `backup` rusqlite feature.
+        // It calls sqlite3_backup_init/step/finish and handles the "source
+        // page was dirtied during backup" retry loop internally, so a
+        // concurrent writer does not corrupt the destination.
+        self.conn
+            .backup(rusqlite::DatabaseName::Main, dst, None)
+            .map_err(|e| IcmError::Database(format!("sqlite online backup failed: {e}")))?;
+
+        // POW-1: Restrict permissions on the backup file. A backup contains
+        // the full memory database (potentially including API keys, client
+        // data) and must not be world-readable. Mirrors the 0o600 mode used
+        // for credentials in cloud.rs. Non-fatal — warn rather than aborting
+        // a successful backup over a permission failure (e.g. FAT32 / NFS).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o600)) {
+                tracing::warn!(
+                    path = %dst.display(),
+                    "backup_to: could not restrict permissions to 0o600: {e}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Atomically claim the backup slot.
+    ///
+    /// Returns `true` if **this** process should perform the backup (i.e. no
+    /// other process has claimed the slot within the configured interval).
+    /// Modelled on `maybe_auto_decay` — a single SQL statement wins the race
+    /// so that in a thundering-herd scenario (many agents starting at once)
+    /// exactly one performs the backup and the rest skip it (KRIT-5).
+    pub fn claim_backup_slot(&self, interval_days: u32) -> IcmResult<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = self
+            .conn
+            .execute(
+                "INSERT INTO icm_metadata (key, value) VALUES ('last_backup_at', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = ?1
+                 WHERE value IS NULL
+                    OR julianday(?1) - julianday(value) >= ?2",
+                rusqlite::params![now, f64::from(interval_days)],
+            )
+            .map_err(db_err)?;
+        Ok(changed > 0)
+    }
+
     /// Check database integrity (issue #313) and return a list of problems.
     /// A healthy database yields exactly `["ok"]`; a damaged one yields one
     /// entry per problem.

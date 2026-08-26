@@ -160,3 +160,32 @@ fn perf_facts_get_at_10k_under_5ms() {
         "facts.get averaged {per_lookup_us}us / lookup over 1k iters (budget 5000us)",
     );
 }
+
+// ──────────────────────────────────────────────────────────────
+// list_all_facts tests
+// ──────────────────────────────────────────────────────────────
+
+/// When a second `set_fact` supersedes the first for the same (entity, key),
+/// `list_all_facts` should return exactly one active fact — the latest one.
+#[test]
+fn list_all_facts_returns_only_active() {
+    let store = test_store();
+    // Insert first value.
+    store.set_fact("host:db", "ip", "10.0.0.1", "test").unwrap();
+    // Supersede it with a new value.
+    store.set_fact("host:db", "ip", "10.0.0.2", "test").unwrap();
+    let facts = store.list_all_facts().unwrap();
+    assert_eq!(
+        facts.len(),
+        1,
+        "list_all_facts must return exactly 1 active fact after supersession"
+    );
+    assert_eq!(
+        facts[0].value, "10.0.0.2",
+        "the active fact must be the latest value"
+    );
+    assert!(
+        facts[0].superseded_at.is_none(),
+        "the returned fact must have superseded_at = None (still active)"
+    );
+}

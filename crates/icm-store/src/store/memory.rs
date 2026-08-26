@@ -591,10 +591,14 @@ impl MemoryStore for SqliteStore {
     }
 
     fn list_all(&self) -> IcmResult<Vec<Memory>> {
+        // POW-3: Removed the previous LIMIT 10000 — `list_all` must return
+        // every row for `icm export` to produce a complete backup. A silent
+        // truncation at 10 000 records would cause unnoticed data loss during
+        // disaster recovery.
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "SELECT {SELECT_COLS} FROM memories ORDER BY weight DESC LIMIT 10000"
+                "SELECT {SELECT_COLS} FROM memories ORDER BY weight DESC"
             ))
             .map_err(db_err)?;
 

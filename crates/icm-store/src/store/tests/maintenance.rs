@@ -385,4 +385,62 @@ fn opening_at_stored_dims_preserves_vectors() {
     );
 }
 
+// ──────────────────────────────────────────────────────────────
+// claim_backup_slot tests
+// ──────────────────────────────────────────────────────────────
+
+/// With no existing row in icm_metadata, the very first call must claim
+/// the slot and return `true`.
+#[test]
+fn claim_backup_slot_first_call_wins() {
+    let store = test_store();
+    let claimed = store.claim_backup_slot(7).unwrap();
+    assert!(claimed, "first call should claim the backup slot");
+}
+
+/// A second call within the interval should see that the row was recently
+/// written and return `false` (another process already owns this window).
+#[test]
+fn claim_backup_slot_second_call_within_interval_skips() {
+    let store = test_store();
+    // First call sets last_backup_at to now.
+    let first = store.claim_backup_slot(7).unwrap();
+    assert!(first, "first call must win");
+    // Second call with the same interval — elapsed days ≈ 0, threshold 7.
+    let second = store.claim_backup_slot(7).unwrap();
+    assert!(!second, "second call within interval should be skipped");
+}
+
+/// With interval_days = 0 the condition `elapsed >= 0` is always true, so
+/// even a call immediately after a previous one should win again.
+#[test]
+fn claim_backup_slot_after_interval_wins_again() {
+    let store = test_store();
+    let first = store.claim_backup_slot(0).unwrap();
+    assert!(first, "first call must win");
+    // With interval_days = 0 any positive elapsed time satisfies >= 0,
+    // and julianday(now) - julianday(now) == 0, which still satisfies >= 0.
+    let second = store.claim_backup_slot(0).unwrap();
+    assert!(second, "with interval_days=0 every call should win");
+}
+
+/// Error-recovery path: after a failed backup the code resets
+/// `last_backup_at` to the Unix epoch ("1970-01-01T00:00:00+00:00") so
+/// the next startup will retry immediately. Verify that a subsequent call
+/// returns `true` regardless of the configured interval.
+#[test]
+fn claim_backup_slot_epoch_reset_allows_immediate_retry() {
+    let store = test_store();
+    // Simulate the failure-reset: write the epoch timestamp directly.
+    store
+        .set_metadata_str("last_backup_at", "1970-01-01T00:00:00+00:00")
+        .unwrap();
+    // Any realistic interval — say 7 days. Elapsed since epoch is huge.
+    let claimed = store.claim_backup_slot(7).unwrap();
+    assert!(
+        claimed,
+        "epoch-reset should allow an immediate retry regardless of interval"
+    );
+}
+
 // === MemoryStore tests ===
